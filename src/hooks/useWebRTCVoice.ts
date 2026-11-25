@@ -216,16 +216,26 @@ export function useWebRTCVoice({
         }
       };
 
-      // When remote track arrives, attach to audio element
+      // When remote track arrives, attach to audio element and play
       pc.ontrack = (event) => {
         const remoteStream = event.streams[0];
         let audioEl = audioElementsRef.current.get(targetUserId);
         if (!audioEl) {
-          audioEl = new Audio();
+          audioEl = document.createElement('audio');
           audioEl.autoplay = true;
+          audioEl.setAttribute('playsinline', 'true');
+          document.body.appendChild(audioEl);
           audioElementsRef.current.set(targetUserId, audioEl);
         }
         audioEl.srcObject = remoteStream;
+        audioEl.play().catch(() => {
+          // Retry on document click if autoplay blocked
+          const unlockAudio = () => {
+            audioEl?.play().catch(() => {});
+            window.removeEventListener('click', unlockAudio);
+          };
+          window.addEventListener('click', unlockAudio);
+        });
 
         setPeers((prev) => ({
           ...prev,
@@ -408,6 +418,9 @@ export function useWebRTCVoice({
       peerConnectionsRef.current.clear();
       audioElementsRef.current.forEach((el) => {
         el.srcObject = null;
+        if (el.parentNode) {
+          el.parentNode.removeChild(el);
+        }
       });
       audioElementsRef.current.clear();
       if (audioContextRef.current) {
