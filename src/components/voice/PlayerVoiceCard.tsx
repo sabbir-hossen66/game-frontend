@@ -153,35 +153,6 @@ export const PlayerVoiceCard: React.FC<PlayerVoiceCardProps> = ({
           />
         </div>
       )}
-
-      {/* Direct JSX Audio Element to guarantee Mobile Browser WebKit & Android Playback */}
-      {!isSelf && peer?.stream && (
-        <audio
-          ref={(el) => {
-            if (el && peer?.stream) {
-              if (el.srcObject !== peer.stream) {
-                el.srcObject = peer.stream;
-              }
-              el.volume = isLocallyMuted ? 0 : currentVolume;
-              el.muted = isLocallyMuted;
-              if (el.paused) {
-                el.play().catch(() => {});
-              }
-            }
-          }}
-          autoPlay
-          playsInline
-          style={{
-            position: 'fixed',
-            top: '-9999px',
-            left: '-9999px',
-            width: '1px',
-            height: '1px',
-            opacity: 0,
-            pointerEvents: 'none',
-          }}
-        />
-      )}
     </div>
   );
 };

@@ -23,13 +23,6 @@ const RTC_CONFIG: RTCConfiguration = {
   iceCandidatePoolSize: 10,
 };
 
-interface PeerState {
-  pc: RTCPeerConnection;
-  makingOffer: boolean;
-  ignoreOffer: boolean;
-  isPolite: boolean;
-}
-
 interface UseWebRTCVoiceProps {
   roomCode: string;
   myUserId: string;
@@ -59,7 +52,6 @@ export function useWebRTCVoice({
   const [peers, setPeers] = useState<Record<string, VoicePeer>>({});
 
   const peerConnectionsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
-  const peerStatesRef = useRef<Map<string, PeerState>>(new Map());
   const audioElementsRef = useRef<Map<string, HTMLAudioElement>>(new Map());
   const iceCandidateQueuesRef = useRef<Map<string, RTCIceCandidateInit[]>>(new Map());
   const audioContextRef = useRef<AudioContext | null>(null);
@@ -112,12 +104,19 @@ export function useWebRTCVoice({
       const audioTrack = stream.getAudioTracks()[0];
       if (audioTrack) {
         peerConnectionsRef.current.forEach((pc) => {
-          const senders = pc.getSenders();
-          const sender = senders.find((s) => s.track === null || s.track?.kind === 'audio');
-          if (sender) {
-            sender.replaceTrack(audioTrack);
+          const transceivers = pc.getTransceivers();
+          const audioTransceiver = transceivers.find((t) => t.receiver.track.kind === 'audio');
+          if (audioTransceiver && audioTransceiver.sender) {
+            audioTransceiver.sender.replaceTrack(audioTrack);
+            audioTransceiver.direction = 'sendrecv';
           } else {
-            pc.addTrack(audioTrack, stream);
+            const senders = pc.getSenders();
+            const sender = senders.find((s) => s.track === null || s.track?.kind === 'audio');
+            if (sender) {
+              sender.replaceTrack(audioTrack);
+            } else {
+              pc.addTrack(audioTrack, stream);
+            }
           }
         });
       }
@@ -242,48 +241,21 @@ export function useWebRTCVoice({
     };
   }, [isPushToTalk]);
 
-  // Create Peer Connection with a target user (Perfect Negotiation Pattern)
+  // Create Peer Connection with a target user
   const createPeerConnection = useCallback(
     (targetUserId: string): RTCPeerConnection => {
       const pc = new RTCPeerConnection(RTC_CONFIG);
-      const isPolite = myUserId < targetUserId;
 
-      const peerState: PeerState = {
-        pc,
-        makingOffer: false,
-        ignoreOffer: false,
-        isPolite,
-      };
-      peerStatesRef.current.set(targetUserId, peerState);
+      // Pre-add transceiver for bidirectional audio
+      const transceiver = pc.addTransceiver('audio', { direction: 'sendrecv' });
 
       // Add local stream track if available
       if (localStreamRef.current) {
-        localStreamRef.current.getTracks().forEach((track) => {
-          pc.addTrack(track, localStreamRef.current!);
-        });
-      }
-
-      // Perfect Negotiation: negotiate whenever tracks change or connection needs offer
-      pc.onnegotiationneeded = async () => {
-        try {
-          peerState.makingOffer = true;
-          const offer = await pc.createOffer();
-          if (pc.signalingState !== 'stable') return;
-          await pc.setLocalDescription(offer);
-          if (socket) {
-            socket.emit('voice:signal', {
-              code: roomCode,
-              targetUserId,
-              senderUserId: myUserId,
-              signal: pc.localDescription,
-            });
-          }
-        } catch (err) {
-          console.warn('[WebRTC] Negotiation error:', err);
-        } finally {
-          peerState.makingOffer = false;
+        const audioTrack = localStreamRef.current.getAudioTracks()[0];
+        if (audioTrack && transceiver.sender) {
+          transceiver.sender.replaceTrack(audioTrack);
         }
-      };
+      }
 
       // Send ICE candidates to target user
       pc.onicecandidate = (event) => {
@@ -327,6 +299,23 @@ export function useWebRTCVoice({
           playPromise.catch((err) => {
             console.warn('[WebRTC] Autoplay waiting for user gesture:', err);
           });
+        }
+
+        // Web Audio routing fallback for mobile speakers
+        try {
+          const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+          if (AudioCtx) {
+            if (!audioContextRef.current) {
+              audioContextRef.current = new AudioCtx();
+            }
+            if (audioContextRef.current.state === 'suspended') {
+              audioContextRef.current.resume().catch(() => {});
+            }
+            const source = audioContextRef.current.createMediaStreamSource(remoteStream);
+            source.connect(audioContextRef.current.destination);
+          }
+        } catch {
+          // Web Audio routing handled
         }
 
         setPeers((prev) => ({
@@ -373,10 +362,26 @@ export function useWebRTCVoice({
   useEffect(() => {
     if (!socket || !roomCode) return;
 
-    remoteUserIds.forEach((targetId) => {
+    remoteUserIds.forEach(async (targetId) => {
       if (targetId === myUserId) return;
       if (!peerConnectionsRef.current.has(targetId)) {
-        createPeerConnection(targetId);
+        const pc = createPeerConnection(targetId);
+
+        // Deterministic offerer: the player whose id is alphabetically greater creates the offer
+        if (myUserId > targetId) {
+          try {
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            socket.emit('voice:signal', {
+              code: roomCode,
+              targetUserId: targetId,
+              senderUserId: myUserId,
+              signal: offer,
+            });
+          } catch (err) {
+            console.warn('[WebRTC] Offer error:', err);
+          }
+        }
       }
     });
 
@@ -385,7 +390,6 @@ export function useWebRTCVoice({
       if (!remoteUserIds.includes(uid)) {
         pc.close();
         peerConnectionsRef.current.delete(uid);
-        peerStatesRef.current.delete(uid);
         iceCandidateQueuesRef.current.delete(uid);
         const el = audioElementsRef.current.get(uid);
         if (el) {
@@ -414,28 +418,11 @@ export function useWebRTCVoice({
       if (!pc) {
         pc = createPeerConnection(senderUserId);
       }
-      let peerState = peerStatesRef.current.get(senderUserId);
-      if (!peerState) {
-        peerState = {
-          pc,
-          makingOffer: false,
-          ignoreOffer: false,
-          isPolite: myUserId < senderUserId,
-        };
-        peerStatesRef.current.set(senderUserId, peerState);
-      }
 
       try {
         if ('type' in signal) {
           const desc = signal as RTCSessionDescriptionInit;
           if (desc.type === 'offer') {
-            const offerCollision = peerState.makingOffer || pc.signalingState !== 'stable';
-            peerState.ignoreOffer = !peerState.isPolite && offerCollision;
-            if (peerState.ignoreOffer) {
-              console.log(`[WebRTC] Glare handled: ignored offer from ${senderUserId} (impolite)`);
-              return;
-            }
-
             await pc.setRemoteDescription(new RTCSessionDescription(desc));
             // Drain queued ICE candidates
             const queued = iceCandidateQueuesRef.current.get(senderUserId) || [];
@@ -463,7 +450,6 @@ export function useWebRTCVoice({
           }
         } else if ('candidate' in signal) {
           const candidateInit = signal as RTCIceCandidateInit;
-          if (peerState.ignoreOffer) return;
           if (!pc.remoteDescription) {
             const queue = iceCandidateQueuesRef.current.get(senderUserId) || [];
             queue.push(candidateInit);
