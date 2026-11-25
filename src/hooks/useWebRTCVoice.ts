@@ -103,19 +103,35 @@ export function useWebRTCVoice({
       // Replace or add track to all active peer connections
       const audioTrack = stream.getAudioTracks()[0];
       if (audioTrack) {
-        peerConnectionsRef.current.forEach((pc) => {
+        peerConnectionsRef.current.forEach(async (pc, targetId) => {
           const transceivers = pc.getTransceivers();
           const audioTransceiver = transceivers.find((t) => t.receiver.track.kind === 'audio');
           if (audioTransceiver && audioTransceiver.sender) {
-            audioTransceiver.sender.replaceTrack(audioTrack);
+            await audioTransceiver.sender.replaceTrack(audioTrack);
             audioTransceiver.direction = 'sendrecv';
           } else {
             const senders = pc.getSenders();
             const sender = senders.find((s) => s.track === null || s.track?.kind === 'audio');
             if (sender) {
-              sender.replaceTrack(audioTrack);
+              await sender.replaceTrack(audioTrack);
             } else {
               pc.addTrack(audioTrack, stream);
+            }
+          }
+
+          // Seamless renegotiation: ensure other peer receives active audio immediately
+          if (pc.signalingState === 'stable' && socket) {
+            try {
+              const offer = await pc.createOffer();
+              await pc.setLocalDescription(offer);
+              socket.emit('voice:signal', {
+                code: roomCode,
+                targetUserId: targetId,
+                senderUserId: myUserId,
+                signal: offer,
+              });
+            } catch (err) {
+              console.warn('[WebRTC] Track renegotiation note:', err);
             }
           }
         });
@@ -123,7 +139,7 @@ export function useWebRTCVoice({
     } catch {
       setAudioPermission('denied');
     }
-  }, []);
+  }, [roomCode, myUserId, socket]);
 
   // Auto-request microphone permission on mount
   useEffect(() => {
@@ -133,23 +149,25 @@ export function useWebRTCVoice({
   // Global user interaction listener to unlock AudioContext & autoplay on iOS/Android & desktop
   useEffect(() => {
     const unlockAudio = () => {
-      if (audioContextRef.current && audioContextRef.current.state === 'suspended') {
-        audioContextRef.current.resume().catch(() => {});
-      }
       audioElementsRef.current.forEach((audioEl) => {
         if (audioEl.paused) {
           audioEl.play().catch(() => {});
         }
       });
+      if (audioContextRef.current && audioContextRef.current.state === 'suspended') {
+        audioContextRef.current.resume().catch(() => {});
+      }
     };
 
     window.addEventListener('click', unlockAudio);
-    window.addEventListener('touchstart', unlockAudio);
-    window.addEventListener('keydown', unlockAudio);
+    window.addEventListener('touchend', unlockAudio);
+    window.addEventListener('touchstart', unlockAudio, { passive: true });
+    window.addEventListener('pointerup', unlockAudio);
     return () => {
       window.removeEventListener('click', unlockAudio);
+      window.removeEventListener('touchend', unlockAudio);
       window.removeEventListener('touchstart', unlockAudio);
-      window.removeEventListener('keydown', unlockAudio);
+      window.removeEventListener('pointerup', unlockAudio);
     };
   }, []);
 
@@ -301,23 +319,6 @@ export function useWebRTCVoice({
           });
         }
 
-        // Web Audio routing fallback for mobile speakers
-        try {
-          const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-          if (AudioCtx) {
-            if (!audioContextRef.current) {
-              audioContextRef.current = new AudioCtx();
-            }
-            if (audioContextRef.current.state === 'suspended') {
-              audioContextRef.current.resume().catch(() => {});
-            }
-            const source = audioContextRef.current.createMediaStreamSource(remoteStream);
-            source.connect(audioContextRef.current.destination);
-          }
-        } catch {
-          // Web Audio routing handled
-        }
-
         setPeers((prev) => ({
           ...prev,
           [targetUserId]: {
@@ -424,6 +425,12 @@ export function useWebRTCVoice({
           const desc = signal as RTCSessionDescriptionInit;
           if (desc.type === 'offer') {
             await pc.setRemoteDescription(new RTCSessionDescription(desc));
+            // Ensure audio transceiver direction is sendrecv in the answer
+            const transceivers = pc.getTransceivers();
+            const audioTransceiver = transceivers.find((t) => t.receiver.track.kind === 'audio');
+            if (audioTransceiver) {
+              audioTransceiver.direction = 'sendrecv';
+            }
             // Drain queued ICE candidates
             const queued = iceCandidateQueuesRef.current.get(senderUserId) || [];
             for (const cand of queued) {
