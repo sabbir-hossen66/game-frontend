@@ -9,7 +9,18 @@ const RTC_CONFIG: RTCConfiguration = {
     { urls: 'stun:stun.l.google.com:19302' },
     { urls: 'stun:stun1.l.google.com:19302' },
     { urls: 'stun:stun2.l.google.com:19302' },
+    { urls: 'stun:stun.relay.metered.ca:80' },
+    {
+      urls: [
+        'turn:openrelay.metered.ca:80',
+        'turn:openrelay.metered.ca:443',
+        'turn:openrelay.metered.ca:443?transport=tcp',
+      ],
+      username: 'openrelayproject',
+      credential: 'openrelayproject',
+    },
   ],
+  iceCandidatePoolSize: 10,
 };
 
 interface UseWebRTCVoiceProps {
@@ -42,6 +53,7 @@ export function useWebRTCVoice({
 
   const peerConnectionsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
   const audioElementsRef = useRef<Map<string, HTMLAudioElement>>(new Map());
+  const iceCandidateQueuesRef = useRef<Map<string, RTCIceCandidateInit[]>>(new Map());
   const audioContextRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const localStreamRef = useRef<MediaStream | null>(null);
@@ -90,18 +102,55 @@ export function useWebRTCVoice({
 
       // Replace or add track to all active peer connections
       const audioTrack = stream.getAudioTracks()[0];
-      peerConnectionsRef.current.forEach((pc) => {
-        const senders = pc.getSenders();
-        const sender = senders.find((s) => s.track?.kind === 'audio');
-        if (sender) {
-          sender.replaceTrack(audioTrack);
-        } else {
-          pc.addTrack(audioTrack, stream);
-        }
-      });
+      if (audioTrack) {
+        peerConnectionsRef.current.forEach((pc) => {
+          const transceivers = pc.getTransceivers();
+          const audioTransceiver = transceivers.find((t) => t.receiver.track.kind === 'audio');
+          if (audioTransceiver && audioTransceiver.sender) {
+            audioTransceiver.sender.replaceTrack(audioTrack);
+            audioTransceiver.direction = 'sendrecv';
+          } else {
+            const senders = pc.getSenders();
+            const sender = senders.find((s) => s.track === null || s.track?.kind === 'audio');
+            if (sender) {
+              sender.replaceTrack(audioTrack);
+            } else {
+              pc.addTrack(audioTrack, stream);
+            }
+          }
+        });
+      }
     } catch {
       setAudioPermission('denied');
     }
+  }, []);
+
+  // Auto-request microphone permission on mount
+  useEffect(() => {
+    initAudio();
+  }, [initAudio]);
+
+  // Global user interaction listener to unlock AudioContext & autoplay on iOS/Android & desktop
+  useEffect(() => {
+    const unlockAudio = () => {
+      if (audioContextRef.current && audioContextRef.current.state === 'suspended') {
+        audioContextRef.current.resume().catch(() => {});
+      }
+      audioElementsRef.current.forEach((audioEl) => {
+        if (audioEl.paused) {
+          audioEl.play().catch(() => {});
+        }
+      });
+    };
+
+    window.addEventListener('click', unlockAudio);
+    window.addEventListener('touchstart', unlockAudio);
+    window.addEventListener('keydown', unlockAudio);
+    return () => {
+      window.removeEventListener('click', unlockAudio);
+      window.removeEventListener('touchstart', unlockAudio);
+      window.removeEventListener('keydown', unlockAudio);
+    };
   }, []);
 
   // Speaking detection loop
@@ -120,7 +169,7 @@ export function useWebRTCVoice({
         const average = sum / dataArray.length;
 
         const effectiveMuted = isMuted || isMutedByHost || (isPushToTalk && !isPttPressed);
-        const speakingNow = !effectiveMuted && average > 18;
+        const speakingNow = !effectiveMuted && average > 12;
 
         if (speakingNow !== isSpeaking) {
           setIsSpeaking(speakingNow);
@@ -197,11 +246,15 @@ export function useWebRTCVoice({
     (targetUserId: string): RTCPeerConnection => {
       const pc = new RTCPeerConnection(RTC_CONFIG);
 
-      // Add local stream tracks
+      // Pre-add transceiver for bidirectional audio
+      const transceiver = pc.addTransceiver('audio', { direction: 'sendrecv' });
+
+      // Add local stream track if available
       if (localStreamRef.current) {
-        localStreamRef.current.getTracks().forEach((track) => {
-          pc.addTrack(track, localStreamRef.current!);
-        });
+        const audioTrack = localStreamRef.current.getAudioTracks()[0];
+        if (audioTrack && transceiver.sender) {
+          transceiver.sender.replaceTrack(audioTrack);
+        }
       }
 
       // Send ICE candidates to target user
@@ -218,24 +271,27 @@ export function useWebRTCVoice({
 
       // When remote track arrives, attach to audio element and play
       pc.ontrack = (event) => {
-        const remoteStream = event.streams[0];
+        const remoteStream = event.streams[0] || new MediaStream([event.track]);
         let audioEl = audioElementsRef.current.get(targetUserId);
         if (!audioEl) {
           audioEl = document.createElement('audio');
           audioEl.autoplay = true;
           audioEl.setAttribute('playsinline', 'true');
+          audioEl.setAttribute('webkit-playsinline', 'true');
+          audioEl.style.display = 'none';
           document.body.appendChild(audioEl);
           audioElementsRef.current.set(targetUserId, audioEl);
         }
         audioEl.srcObject = remoteStream;
-        audioEl.play().catch(() => {
-          // Retry on document click if autoplay blocked
-          const unlockAudio = () => {
-            audioEl?.play().catch(() => {});
-            window.removeEventListener('click', unlockAudio);
-          };
-          window.addEventListener('click', unlockAudio);
-        });
+        audioEl.volume = 1.0;
+        audioEl.muted = false;
+
+        const playPromise = audioEl.play();
+        if (playPromise !== undefined) {
+          playPromise.catch((err) => {
+            console.warn('[WebRTC] Autoplay blocked, waiting for user gesture:', err);
+          });
+        }
 
         setPeers((prev) => ({
           ...prev,
@@ -243,10 +299,10 @@ export function useWebRTCVoice({
             userId: targetUserId,
             peerConnection: pc,
             stream: remoteStream,
-            isMuted: false,
-            isSpeaking: false,
-            volume: 1.0,
-            isLocallyMuted: false,
+            isMuted: prev[targetUserId]?.isMuted ?? false,
+            isSpeaking: prev[targetUserId]?.isSpeaking ?? false,
+            volume: prev[targetUserId]?.volume ?? 1.0,
+            isLocallyMuted: prev[targetUserId]?.isLocallyMuted ?? false,
           },
         }));
       };
@@ -254,8 +310,20 @@ export function useWebRTCVoice({
       pc.onconnectionstatechange = () => {
         if (pc.connectionState === 'connected') {
           setConnectionQuality('good');
+        } else if (pc.connectionState === 'connecting') {
+          setConnectionQuality('medium');
         } else if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') {
           setConnectionQuality('poor');
+        }
+      };
+
+      pc.oniceconnectionstatechange = () => {
+        if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+          setConnectionQuality('good');
+        } else if (pc.iceConnectionState === 'failed') {
+          if (typeof pc.restartIce === 'function') {
+            pc.restartIce();
+          }
         }
       };
 
@@ -327,6 +395,13 @@ export function useWebRTCVoice({
           const desc = signal as RTCSessionDescriptionInit;
           if (desc.type === 'offer') {
             await pc.setRemoteDescription(new RTCSessionDescription(desc));
+            // Drain queued ICE candidates
+            const queued = iceCandidateQueuesRef.current.get(senderUserId) || [];
+            for (const cand of queued) {
+              await pc.addIceCandidate(new RTCIceCandidate(cand)).catch(() => {});
+            }
+            iceCandidateQueuesRef.current.set(senderUserId, []);
+
             const answer = await pc.createAnswer();
             await pc.setLocalDescription(answer);
             socket.emit('voice:signal', {
@@ -337,13 +412,25 @@ export function useWebRTCVoice({
             });
           } else if (desc.type === 'answer') {
             await pc.setRemoteDescription(new RTCSessionDescription(desc));
+            // Drain queued ICE candidates
+            const queued = iceCandidateQueuesRef.current.get(senderUserId) || [];
+            for (const cand of queued) {
+              await pc.addIceCandidate(new RTCIceCandidate(cand)).catch(() => {});
+            }
+            iceCandidateQueuesRef.current.set(senderUserId, []);
           }
         } else if ('candidate' in signal) {
           const candidateInit = signal as RTCIceCandidateInit;
-          await pc.addIceCandidate(new RTCIceCandidate(candidateInit));
+          if (!pc.remoteDescription) {
+            const queue = iceCandidateQueuesRef.current.get(senderUserId) || [];
+            queue.push(candidateInit);
+            iceCandidateQueuesRef.current.set(senderUserId, queue);
+          } else {
+            await pc.addIceCandidate(new RTCIceCandidate(candidateInit)).catch(() => {});
+          }
         }
-      } catch {
-        // Signaling collision or track negotiation error handled
+      } catch (err) {
+        console.warn('[WebRTC] Signaling error:', err);
       }
     };
 
@@ -353,14 +440,17 @@ export function useWebRTCVoice({
       isSpeaking: boolean;
     }) => {
       setPeers((prev) => {
-        const peer = prev[payload.userId];
-        if (!peer) return prev;
+        const existing = prev[payload.userId];
         return {
           ...prev,
           [payload.userId]: {
-            ...peer,
+            userId: payload.userId,
+            peerConnection: existing?.peerConnection || (peerConnectionsRef.current.get(payload.userId) as RTCPeerConnection),
+            stream: existing?.stream,
             isMuted: payload.isMuted,
             isSpeaking: payload.isSpeaking,
+            volume: existing?.volume ?? 1.0,
+            isLocallyMuted: existing?.isLocallyMuted ?? false,
           },
         };
       });

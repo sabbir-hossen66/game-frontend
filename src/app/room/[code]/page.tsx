@@ -356,7 +356,12 @@ function RoomContent() {
       <footer className="fixed bottom-3 left-0 right-0 z-40 max-w-2xl mx-auto px-4">
         <VoiceBar
           isMuted={voice.isMuted}
-          onToggleMute={() => voice.setIsMuted(!voice.isMuted)}
+          onToggleMute={() => {
+            if (!voice.localStream) {
+              voice.initAudio();
+            }
+            voice.setIsMuted(!voice.isMuted);
+          }}
           isSpeaking={voice.isSpeaking}
           isPushToTalk={voice.isPushToTalk}
           onTogglePushToTalk={voice.setIsPushToTalk}
