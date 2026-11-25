@@ -47,6 +47,7 @@ export function useWebRTCVoice({
   const [availableMics, setAvailableMics] = useState<MediaDeviceInfo[]>([]);
   const [selectedMicId, setSelectedMicId] = useState<string>('');
   const [connectionQuality, setConnectionQuality] = useState<'good' | 'medium' | 'poor'>('good');
+  const [isAudioBlocked, setIsAudioBlocked] = useState(false);
 
   // Map of remoteUserId -> VoicePeer info
   const [peers, setPeers] = useState<Record<string, VoicePeer>>({});
@@ -147,18 +148,17 @@ export function useWebRTCVoice({
   }, [initAudio]);
 
   // Global user interaction listener to unlock AudioContext & autoplay on iOS/Android & desktop
-  useEffect(() => {
-    const unlockAudio = () => {
-      audioElementsRef.current.forEach((audioEl) => {
-        if (audioEl.paused) {
-          audioEl.play().catch(() => {});
-        }
-      });
-      if (audioContextRef.current && audioContextRef.current.state === 'suspended') {
-        audioContextRef.current.resume().catch(() => {});
-      }
-    };
+  const unlockAudio = useCallback(() => {
+    audioElementsRef.current.forEach((audioEl) => {
+      audioEl.play().catch(() => {});
+    });
+    if (audioContextRef.current && audioContextRef.current.state === 'suspended') {
+      audioContextRef.current.resume().catch(() => {});
+    }
+    setIsAudioBlocked(false);
+  }, []);
 
+  useEffect(() => {
     window.addEventListener('click', unlockAudio);
     window.addEventListener('touchend', unlockAudio);
     window.addEventListener('touchstart', unlockAudio, { passive: true });
@@ -169,7 +169,7 @@ export function useWebRTCVoice({
       window.removeEventListener('touchstart', unlockAudio);
       window.removeEventListener('pointerup', unlockAudio);
     };
-  }, []);
+  }, [unlockAudio]);
 
   // Speaking detection loop
   useEffect(() => {
@@ -264,15 +264,13 @@ export function useWebRTCVoice({
     (targetUserId: string): RTCPeerConnection => {
       const pc = new RTCPeerConnection(RTC_CONFIG);
 
-      // Pre-add transceiver for bidirectional audio
-      const transceiver = pc.addTransceiver('audio', { direction: 'sendrecv' });
-
-      // Add local stream track if available
+      // Add local stream tracks with stream context if available, otherwise transceiver
       if (localStreamRef.current) {
-        const audioTrack = localStreamRef.current.getAudioTracks()[0];
-        if (audioTrack && transceiver.sender) {
-          transceiver.sender.replaceTrack(audioTrack);
-        }
+        localStreamRef.current.getTracks().forEach((track) => {
+          pc.addTrack(track, localStreamRef.current!);
+        });
+      } else {
+        pc.addTransceiver('audio', { direction: 'sendrecv' });
       }
 
       // Send ICE candidates to target user
@@ -316,6 +314,7 @@ export function useWebRTCVoice({
         if (playPromise !== undefined) {
           playPromise.catch((err) => {
             console.warn('[WebRTC] Autoplay waiting for user gesture:', err);
+            setIsAudioBlocked(true);
           });
         }
 
@@ -425,6 +424,19 @@ export function useWebRTCVoice({
           const desc = signal as RTCSessionDescriptionInit;
           if (desc.type === 'offer') {
             await pc.setRemoteDescription(new RTCSessionDescription(desc));
+            // Ensure local track is attached before answering
+            if (localStreamRef.current) {
+              const audioTrack = localStreamRef.current.getAudioTracks()[0];
+              if (audioTrack) {
+                const senders = pc.getSenders();
+                const audioSender = senders.find((s) => s.track === null || s.track?.kind === 'audio');
+                if (audioSender) {
+                  await audioSender.replaceTrack(audioTrack);
+                } else {
+                  pc.addTrack(audioTrack, localStreamRef.current);
+                }
+              }
+            }
             // Ensure audio transceiver direction is sendrecv in the answer
             const transceivers = pc.getTransceivers();
             const audioTransceiver = transceivers.find((t) => t.receiver.track.kind === 'audio');
@@ -576,5 +588,7 @@ export function useWebRTCVoice({
     peers,
     setPeerVolume,
     togglePeerLocalMute,
+    isAudioBlocked,
+    unlockAudio,
   };
 }

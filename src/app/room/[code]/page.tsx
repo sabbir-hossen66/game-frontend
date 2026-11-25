@@ -195,7 +195,25 @@ function RoomContent() {
   const isPlaying = room?.status === 'playing' && gameState !== null;
 
   return (
-    <div className="min-h-screen bg-gradient-to-b from-slate-950 via-[#0d101e] to-slate-950 text-slate-100 flex flex-col justify-between p-3 sm:p-6 pb-24">
+    <div
+      onClick={voice.unlockAudio}
+      onTouchEnd={voice.unlockAudio}
+      className="min-h-screen bg-gradient-to-b from-slate-950 via-[#0d101e] to-slate-950 text-slate-100 flex flex-col justify-between p-3 sm:p-6 pb-24"
+    >
+      {/* Floating Audio Playback Unlock Banner for Mobile & WebKit */}
+      {voice.isAudioBlocked && (
+        <div className="max-w-md w-full mx-auto my-3 px-3">
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              voice.unlockAudio();
+            }}
+            className="w-full py-3 px-4 bg-gradient-to-r from-emerald-500 via-teal-400 to-cyan-500 text-slate-950 font-black text-xs sm:text-sm rounded-2xl shadow-xl shadow-cyan-500/30 animate-pulse flex items-center justify-center gap-2 cursor-pointer border-2 border-white/40"
+          >
+            <Volume2 size={18} /> 🔊 Tap Here to Enable Voice Sound on this Device
+          </button>
+        </div>
+      )}
       {/* Top Navbar */}
       <header className="max-w-7xl w-full mx-auto flex items-center justify-between pb-4 border-b border-slate-800/80">
         <div className="flex items-center gap-3">
